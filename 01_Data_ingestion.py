@@ -2,7 +2,7 @@
 import time
 import requests
 import json
-from pyspark.sql.functions import col, to_timestamp, lit, when
+from pyspark.sql.functions import col, to_timestamp, lit, when, concat, from_utc_timestamp
 from pyspark.sql.types import StructType, StructField, StringType, IntegerType, DoubleType, TimestampType
 
 
@@ -218,4 +218,41 @@ df_combined.show(10)
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC #Data Cleaning and Validation
 
+# COMMAND ----------
+
+df_combined = df_combined.fillna({
+    'departure_delay': 0,
+    'arrival_delay': 0
+})
+
+df_combined = df_combined.dropna(subset=['flight_number','departure_iataCode','arrival_iataCode'])
+
+# COMMAND ----------
+
+df_combined = df_combined.withColumn('flight_date', col('departure_scheduledTime').cast('date'))
+df_combined = df_combined.withColumn('display_airline',
+                when(
+                        col('codeshared_airline_name').isNotNull(),
+                        concat(
+                            col('airline_name'),
+                            lit('(Codeshare: '),
+                            col('codeshared_airline_name'),
+                            lit(')')
+                        )
+                    ).otherwise(col('airline_name'))
+            )
+df_combined = df_combined.dropDuplicates(['flight_number','flight_date'])
+df_combined = df_combined.filter((col('departure_delay') >= 0) & (col('arrival_delay') >= 0))
+df_combined = df_combined.withColumn('total_delay', col('departure_delay') + col('arrival_delay'))
+
+# COMMAND ----------
+
+df_combined = df_combined.withColumn('on_time', (col('total_delay') == 0))
+df_combined = df_combined.withColumn('departure_scheduled_time_utc',from_utc_timestamp(col('departure_scheduledTime'),'UTC')).withColumn('arrival_scheduled_time_utc',from_utc_timestamp(col('arrival_scheduledTime'),'UTC')).withColumn('departure_actual_time_utc',from_utc_timestamp(col('departure_actualTime'),'UTC')).withColumn('arrival_actual_time_utc',from_utc_timestamp(col('arrival_actualTime'),'UTC')).withColumn('departure_estimated_time_utc',from_utc_timestamp(col('departure_estimatedTime'),'UTC')).withColumn('arrival_estimated_time_utc',from_utc_timestamp(col('arrival_estimatedTime'),'UTC'))
+
+# COMMAND ----------
+
+display(df_combined.select('flight_status'))
