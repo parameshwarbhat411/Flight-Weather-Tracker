@@ -2,9 +2,9 @@
 import time
 import requests
 import json
-from pyspark.sql.functions import col, to_timestamp, lit, when, concat, from_utc_timestamp
+from pyspark.sql.functions import col, to_timestamp, lit, when, concat, from_utc_timestamp, current_timestamp
 from pyspark.sql.types import StructType, StructField, StringType, IntegerType, DoubleType, TimestampType
-
+from delta.tables import DeltaTable
 
 # COMMAND ----------
 
@@ -251,8 +251,109 @@ df_combined = df_combined.withColumn('total_delay', col('departure_delay') + col
 # COMMAND ----------
 
 df_combined = df_combined.withColumn('on_time', (col('total_delay') == 0))
-df_combined = df_combined.withColumn('departure_scheduled_time_utc',from_utc_timestamp(col('departure_scheduledTime'),'UTC')).withColumn('arrival_scheduled_time_utc',from_utc_timestamp(col('arrival_scheduledTime'),'UTC')).withColumn('departure_actual_time_utc',from_utc_timestamp(col('departure_actualTime'),'UTC')).withColumn('arrival_actual_time_utc',from_utc_timestamp(col('arrival_actualTime'),'UTC')).withColumn('departure_estimated_time_utc',from_utc_timestamp(col('departure_estimatedTime'),'UTC')).withColumn('arrival_estimated_time_utc',from_utc_timestamp(col('arrival_estimatedTime'),'UTC'))
+# df_combined = df_combined.withColumn('departure_scheduled_time_utc',from_utc_timestamp(col('departure_scheduledTime'),'UTC')).withColumn('arrival_scheduled_time_utc',from_utc_timestamp(col('arrival_scheduledTime'),'UTC')).withColumn('departure_actual_time_utc',from_utc_timestamp(col('departure_actualTime'),'UTC')).withColumn('arrival_actual_time_utc',from_utc_timestamp(col('arrival_actualTime'),'UTC')).withColumn('departure_estimated_time_utc',from_utc_timestamp(col('departure_estimatedTime'),'UTC')).withColumn('arrival_estimated_time_utc',from_utc_timestamp(col('arrival_estimatedTime'),'UTC'))
 
 # COMMAND ----------
 
 display(df_combined.select('flight_status'))
+
+# COMMAND ----------
+
+df_airports = spark.read.table('airport_data_buckets')
+
+df_airports.cache()
+df_airports.count()
+
+# COMMAND ----------
+
+df_departure_airports = df_airports.select(
+    col("iata_code").alias("departure_iataCode"),
+    col("icao_code").alias("departure_icaoCode"),
+    col("airport_name").alias("departure_airport_name"),
+    col("timezone").alias("departure_timezone"),
+    col("country_name").alias("departure_country")
+)
+
+df_arrival_airports = df_airports.select(
+    col("iata_code").alias("arrival_iataCode"),
+    col("icao_code").alias("arrival_icaoCode"),
+    col("airport_name").alias("arrival_airport_name"),
+    col("timezone").alias("arrival_timezone"),
+    col("country_name").alias("arrival_country")
+)
+
+# COMMAND ----------
+
+df_final = df_combined.join(df_departure_airports, on=[
+    df_combined.departure_iataCode == df_departure_airports.departure_iataCode,
+     df_combined.departure_icaoCode == df_departure_airports.departure_icaoCode],  
+    how="left").select(
+    df_combined["*"],  
+    df_departure_airports.departure_airport_name,
+    df_departure_airports.departure_timezone,
+    df_departure_airports.departure_country
+)
+
+# COMMAND ----------
+
+df_final = df_final.join(df_arrival_airports, on=[
+    df_final.arrival_iataCode == df_arrival_airports.arrival_iataCode,
+     df_final.arrival_icaoCode == df_arrival_airports.arrival_icaoCode],  
+    how="left").select(
+    df_final["*"],  
+    df_arrival_airports.arrival_airport_name,
+    df_arrival_airports.arrival_timezone,
+    df_arrival_airports.arrival_country
+)
+
+# COMMAND ----------
+
+df_final.select(
+    "flight_number",
+    "display_airline",
+    "departure_airport_name",
+    "departure_timezone",
+    "departure_country",
+    "arrival_airport_name",
+    "arrival_timezone",
+    "arrival_country",
+    "departure_scheduledTime",
+    "arrival_scheduledTime",
+    "flight_date"
+).show(10, truncate=False)
+
+# COMMAND ----------
+
+#display(df_final.select('arrival_iataCode').distinct())
+df_final = df_final.withColumn("ingestion_time", current_timestamp())
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC #Data Ingestion to Delta Lake
+
+# COMMAND ----------
+
+delta_table_name = "processed_flight_data"
+
+if DeltaTable.isDeltaTable(spark, f"delta.`/mnt/flight-data/{delta_table_name}`"):
+
+    delta_table = DeltaTable.forName(spark, delta_table_name)
+
+    delta_table.alias("target").merge(
+        df_final.alias("source"),
+        "target.flight_number = source.flight_number AND target.flight_date = source.flight_date",
+    ).whenMatchedUpdateAll("source.ingestion_time > target.ingestion_time") \
+    .whenNotMatchedInsertAll \
+    .execute()
+
+else:
+    df_final.write.format("delta") \
+    .partitionBy('flight_date') \
+    .mode("overwrite") \
+    .saveAsTable(delta_table_name)
+
+spark.sql(f"""
+    OPTIMIZE {delta_table_name}
+    ZORDER BY (departure_iataCode, arrival_iataCode)
+""")
